@@ -1,0 +1,293 @@
+import torch
+from torch import nn, optim
+from torch.utils.data import Dataset, DataLoader
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+import gc
+
+# 設備設置
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+# if torch.backends.mps.is_available():
+#     device = torch.device("mps")  # Apple Silicon GPU
+#     print("Using device: MPS (Metal Performance Shader)")
+# else:
+#     device = torch.device("cpu")
+#     print("Using device: CPU")
+
+# 建立資料夾存圖
+os.makedirs("hysteresisloops_Transformer", exist_ok=True)
+
+# 讀取數據
+file_path_dip = r'./specimen_displacement_with_info.csv'  
+data_dip = pd.read_csv(file_path_dip)
+file_path_force = r'./specimen_force_with_info.csv'
+data_force = pd.read_csv(file_path_force)
+
+selected_info = [1, 3, 7, 8, 4, 5, 2, 6, 9, 10]
+input_features = data_dip.iloc[:, selected_info]
+input_dis = data_dip.iloc[:, 20::]  
+input_force = data_force.iloc[:, 1::]
+
+# 轉換為 NumPy 數組
+a = input_features.values
+x = input_dis.values
+y = input_force.values
+
+# 特徵數據正規化 (逐特徵)
+def per_feature_normalize(data):
+    normalized_data = np.zeros_like(data)
+    mins = []
+    maxs = []
+    for i in range(data.shape[1]):
+        min_val = np.min(data[:, i])
+        max_val = np.max(data[:, i])
+        mins.append(min_val)
+        maxs.append(max_val)
+        normalized_data[:, i] = 2 * (data[:, i] - min_val) / (max_val - min_val) -1
+    return normalized_data, np.array(mins), np.array(maxs)
+
+a, a_mins, a_maxs = per_feature_normalize(a)
+
+def per_feature_denormalize(data, mins, maxs):
+    original_data = np.zeros_like(data)
+    for i in range(data.shape[1]):
+        original_data[:, i] = (data[:, i] + 1) / 2 * (maxs[i] - mins[i]) + mins[i]
+    return original_data
+
+
+def per_sample_zscore_normalize(data):
+    means = data.mean(axis=1, keepdims=True)
+    stds = data.std(axis=1, keepdims=True)
+    normalized_data = (data - means) / stds
+    return normalized_data, means, stds
+
+# 反標準化函數
+def per_sample_zscore_denormalize(normalized_data, means, stds):
+    return normalized_data * stds + means
+
+# 進行位移和力的逐筆Z-score標準化
+x, x_mean, x_std = per_sample_zscore_normalize(x)
+y, y_mean, y_std = per_sample_zscore_normalize(y)
+
+# 數據集類
+class HysteresisDataset(Dataset):
+    def __init__(self, features_data, displacement_data, force_data):
+        self.features_data = torch.tensor(features_data, dtype=torch.float32)
+        self.displacement_data = torch.tensor(displacement_data, dtype=torch.float32).unsqueeze(-1)
+        self.force_data = torch.tensor(force_data, dtype=torch.float32).unsqueeze(-1)
+    def __len__(self):
+        return len(self.displacement_data)
+    def __getitem__(self, idx):
+        return self.features_data[idx], self.displacement_data[idx], self.force_data[idx]
+
+
+
+# 訓練參數設置
+latent_dim = 50
+condition_dim = 10
+output_dim = 1
+batch_size = 64
+lambda_gp = 5 # 梯度懲罰係數
+n_critic = 3
+Lr = 0.00001
+epochs = 10000
+Hidden_dim = 128
+Num_layers = 2
+num_heads = 4
+
+
+# 建立數據集和資料加載器
+dataset = HysteresisDataset(a, x, y)
+data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+# 定義生成器 (Transformer)
+class Generator(nn.Module):
+    def __init__(self, latent_dim, condition_dim, output_dim, num_heads, hidden_dim = Hidden_dim, num_layers = Num_layers):
+        super(Generator, self).__init__()
+        self.embedding = nn.Linear(latent_dim + condition_dim, hidden_dim)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=num_heads)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(hidden_dim * 2, output_dim)
+        )
+
+    def forward(self, noise, condition):
+        x = torch.cat((noise, condition), dim=2)
+        x = self.embedding(x)
+        x = self.transformer(x)
+        x = self.fc(x)
+        return x
+
+# 定義判別器 (Transformer)
+class Discriminator(nn.Module):
+    def __init__(self, condition_dim, input_dim, num_heads, hidden_dim = Hidden_dim, num_layers = Num_layers):
+        super(Discriminator, self).__init__()
+        self.embedding = nn.Linear(input_dim + condition_dim, hidden_dim)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=num_heads)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(hidden_dim * 2, output_dim)
+        )
+
+    def forward(self, data, condition):
+        x = torch.cat((data, condition), dim=2)
+        x = self.embedding(x)
+        x = self.transformer(x)
+        x = self.fc(x)
+        return x
+
+# 設定隨機種子以確保可重現性
+def seed_everything(seed=42):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+    if torch.backends.mps.is_available():
+        torch.manual_seed(seed)
+
+seed_everything(42)  # 可以根據需求更改種子
+
+
+def weights_init(m):
+    if isinstance(m, nn.Linear):
+        nn.init.xavier_normal_(m.weight)  # 使用 Xavier Normal 初始化
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
+    elif isinstance(m, nn.TransformerEncoderLayer):
+        for param in m.parameters():
+            if param.dim() > 1:
+                nn.init.xavier_uniform_(param)  # 使用 Xavier Uniform 初始化
+    elif isinstance(m, nn.Conv1d) or isinstance(m, nn.Conv2d):
+        nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
+# Linear 層：使用 Xavier Normal，適合沒有 ReLU 的線性層。
+
+# TransformerEncoderLayer：使用 Xavier Uniform，因為多頭自注意力中使用了 Softmax，通常使用 Xavier 初始化較為穩定。
+
+# 卷積層 (若有)：使用 Kaiming Normal，因為這些層一般配合 ReLU 使用。
+
+
+# 初始化生成器和判別器
+generator = Generator(latent_dim, condition_dim, output_dim, num_heads).to(device)
+discriminator = Discriminator(condition_dim, output_dim, num_heads).to(device)
+
+# 權重初始化
+generator.apply(weights_init)
+discriminator.apply(weights_init)
+
+# 定義優化器
+optimizer_G = optim.Adam(generator.parameters(), lr=Lr, betas=(0.5, 0.9))
+optimizer_D = optim.Adam(discriminator.parameters(), lr=Lr, betas=(0.5, 0.9))
+
+# 梯度懲罰 (WGAN-GP)
+def compute_gradient_penalty(D, real_samples, fake_samples, condition):
+    alpha = torch.rand(real_samples.size(0), 1, 1).to(device)
+    interpolates = (alpha * real_samples + (1 - alpha) * fake_samples).requires_grad_(True)
+    d_interpolates = D(interpolates, condition)
+    gradients = torch.autograd.grad(outputs=d_interpolates, inputs=interpolates,
+                                    grad_outputs=torch.ones_like(d_interpolates), create_graph=True)[0]
+    gradients = gradients.view(gradients.size(0), -1)
+    return ((gradients.norm(2, dim=1) - 1) ** 2).mean()
+
+print("Transformer-CWGAN-GP 建立完成")
+
+# 遲滯回圈繪圖函數
+def plot_hysteresis(real_dis, real_force, gen_dis, gen_force, epoch):
+    plt.figure(figsize=(8, 6))
+    plt.plot(real_dis, real_force, label='Real Hysteresis Loop', marker='o', linestyle='-', alpha=0.7)
+    plt.plot(gen_dis, gen_force, label='Generated Hysteresis Loop', marker='x', linestyle='--', alpha=0.7)
+    plt.xlabel("Displacement")
+    plt.ylabel("Force")
+    plt.title(f"Hysteresis Loop Comparison at Epoch {epoch}")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(f"hysteresisloops_Transformer/hysteresis_comparison_epoch_{epoch}.png")
+    plt.close()
+
+# 訓練過程
+d_losses, g_losses = [], []
+
+for epoch in range(epochs):
+    for i, (features, real_dis, real_data) in enumerate(data_loader):
+        features, real_dis, real_data = features.to(device), real_dis.to(device), real_data.to(device)
+        condition = features.unsqueeze(1).expand(-1, real_data.size(1), -1)
+        noise = torch.randn((real_data.size(0), real_data.size(1), latent_dim), device=device)
+
+        # 訓練判別器
+        optimizer_D.zero_grad()
+        fake_data = generator(noise, condition)
+        real_validity = discriminator(real_data, condition)
+        fake_validity = discriminator(fake_data.detach(), condition)
+        gp = compute_gradient_penalty(discriminator, real_data, fake_data, condition)
+        d_loss = -torch.mean(real_validity) + torch.mean(fake_validity) + lambda_gp * gp
+        d_loss.backward()
+        optimizer_D.step()
+
+        # 訓練生成器
+        if i % n_critic == 0:
+            optimizer_G.zero_grad()
+            generated_data = generator(noise, condition)
+            g_loss = -torch.mean(discriminator(generated_data, condition))
+            g_loss.backward()
+            optimizer_G.step()
+
+        # 每 10 個批次打印一次
+        if i % 100 == 0:
+            print(f'Epoch [{epoch}/{epochs}] | Batch [{i}/{len(data_loader)}] | D Loss: {d_loss.item()} | G Loss: {g_loss.item()}')
+
+    d_losses.append(d_loss.item())
+    g_losses.append(g_loss.item())
+
+    # 每 100 個 epoch 繪製遲滯回圈比較圖
+    if epoch % 100 == 0:
+        # 從第一個批次取樣
+        real_dis_sample = real_dis[0].cpu().numpy().squeeze()
+        real_force_sample = real_data[0].cpu().numpy().squeeze()
+        gen_force_sample = generated_data[0].detach().cpu().numpy().squeeze()
+
+        # 反標準化處理
+        real_dis_sample = per_sample_zscore_denormalize(real_dis_sample, x_mean[0], x_std[0])
+        real_force_sample = per_sample_zscore_denormalize(real_force_sample, y_mean[0], y_std[0])
+        gen_force_sample = per_sample_zscore_denormalize(gen_force_sample, y_mean[0], y_std[0])
+        
+
+
+        # 因為位移是原數據中的 x，因此直接使用 real_dis_sample 作為 X 軸
+        plot_hysteresis(real_dis_sample, real_force_sample, real_dis_sample, gen_force_sample, epoch)
+        print(f"Hysteresis loop comparison plot saved at epoch {epoch}")
+
+
+    # 每 1000 個 epoch 儲存一次模型
+    if epoch % 1000 == 0:
+        torch.save(generator.state_dict(), f'generator_epoch_{epoch}.pth')
+        torch.save(discriminator.state_dict(), f'discriminator_epoch_{epoch}.pth')
+
+print("訓練完成，儲存最終模型")
+torch.save(generator.state_dict(), 'generator_transformer.pth')
+torch.save(discriminator.state_dict(), 'discriminator_transformer.pth')
+
+# 損失可視化
+plt.figure(figsize=(10, 5))
+plt.plot(d_losses, label='Discriminator Loss')
+plt.plot(g_losses, label='Generator Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.legend()
+plt.title('Training Loss of Transformer-CWGAN-GP')
+plt.savefig("hysteresisloops_Normalize_Transformer/training_loss.png")
+plt.show()
