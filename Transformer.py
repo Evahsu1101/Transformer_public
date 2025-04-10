@@ -29,8 +29,8 @@ data_force = pd.read_csv(file_path_force)
 
 selected_info = [1, 3, 7, 8, 4, 5, 2, 6, 9, 10]
 input_features = data_dip.iloc[:, selected_info]
-input_dis = data_dip.iloc[:, 20::10]  
-input_force = data_force.iloc[:, 1::10]
+input_dis = data_dip.iloc[:, 20::]  
+input_force = data_force.iloc[:, 1::]
 
 # 轉換為 NumPy 數組
 a = input_features.values
